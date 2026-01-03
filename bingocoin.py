@@ -22,11 +22,12 @@ PORT = 9090
 # IN-MEMORY STATE (NO DB)
 # ==========================
 GAME: Dict[str, Any] = {
-    "players": {},   # user_id -> {name, role, saldo}
-    "ledger": {},    # user_id -> list of {delta, note, ts}
-    "prizes": [],    # list of {name, amount, winner_id, paid, ts}
-    "pot": 0,        # montepremi
+    "players": {},               # user_id -> {name, role, saldo}
+    "ledger": {},                # user_id -> list of {delta, note, ts}
+    "prizes": [],                # list of {name, amount, winner_id, paid, ts}
+    "pot": 0,                    # montepremi
     "log": [],
+    "cashier_rejoin_token": None # segreto per rientro cassiere
 }
 
 # ==========================
@@ -252,7 +253,7 @@ HTML = """<!doctype html>
     <div style="margin-top:10px;">
       <button onclick="doJoin()">Entra</button>
     </div>
-    <div class="small" style="margin-top:8px;">Il cassiere può rientrare col PIN.</div>
+    <div class="small" style="margin-top:8px;">Il cassiere può rientrare col PIN + token di rientro (salvato sul dispositivo).</div>
   </div>
 
   <div class="card hide" id="meCard">
@@ -394,6 +395,18 @@ function loadSession(){
   }catch(e){}
 }
 
+function getCashierRejoinToken(){
+  try { return localStorage.getItem("bingocoin_cashier_rejoin_token") || ""; } catch(e){ return ""; }
+}
+function setCashierRejoinToken(t){
+  try {
+    if(t) localStorage.setItem("bingocoin_cashier_rejoin_token", t);
+  } catch(e){}
+}
+function clearCashierRejoinToken(){
+  try { localStorage.removeItem("bingocoin_cashier_rejoin_token"); } catch(e){}
+}
+
 el("role").addEventListener("change", () => {
   el("pinWrap").classList.toggle("hide", el("role").value !== "cassiere");
 });
@@ -422,10 +435,12 @@ function connectWS(){
 }
 
 async function doJoin(){
+  const role = el("role").value;
   const payload = {
     name: (el("name").value || "").trim(),
-    role: el("role").value,
-    pin:  (el("pin").value || "").trim()
+    role: role,
+    pin:  (el("pin").value || "").trim(),
+    rejoin_token: role === "cassiere" ? getCashierRejoinToken() : ""
   };
   const res = await fetch("/join", {
     method:"POST",
@@ -437,6 +452,12 @@ async function doJoin(){
     return;
   }
   const data = await res.json();
+
+  // se è cassiere, salva il token di rientro (se presente)
+  if(data.role === "cassiere" && data.rejoin_token){
+    setCashierRejoinToken(data.rejoin_token);
+  }
+
   me = { id: data.id, name: data.name, role: data.role };
   saveSession();
   if(ws && ws.readyState === 1){
@@ -485,7 +506,6 @@ function render(){
     el("playerPrizesCard").classList.remove("hide");
     el("historyCard").classList.remove("hide");
 
-    // premi non assegnati
     const prizes = snapshot.prizes || [];
     const pw = el("playerPrizesList");
     pw.innerHTML = "";
@@ -526,11 +546,9 @@ function render(){
   const players = (snapshot.players || []);
   const onlyPlayers = players.filter(p => p.role === "giocatore");
 
-  // mappa id->nome per mostrare vincitore
   const idToName = {};
   players.forEach(p => { idToName[p.id] = p.name; });
 
-  // saldi
   const bal = el("balancesList");
   bal.innerHTML = "";
   if(players.length === 0){
@@ -544,7 +562,6 @@ function render(){
     });
   }
 
-  // dropdown accrediti
   const sel = el("creditPlayer");
   sel.innerHTML = "";
   onlyPlayers.forEach(p => {
@@ -554,13 +571,11 @@ function render(){
     sel.appendChild(opt);
   });
 
-  // pot box
   const potVal = snapshot.pot?.pot ?? 0;
   const unpaidTotal = snapshot.pot?.prizes_defined_total ?? 0;
   const remaining = snapshot.pot?.pot_remaining ?? 0;
   el("potBox").textContent = `Montepremi: ${fmtBE(potVal)} · Premi (non pagati) creati: ${fmtBE(unpaidTotal)} · Residuo: ${fmtBE(remaining)}`;
 
-  // premi + assegnazione
   const assign = el("assignWrap");
   assign.innerHTML = "";
   const prizes = snapshot.prizes || [];
@@ -569,7 +584,6 @@ function render(){
   } else {
     prizes.forEach((pr, idx) => {
       const paid = !!pr.paid;
-
       const div = document.createElement("div");
       div.className = "pill";
 
@@ -610,7 +624,6 @@ function render(){
     });
   }
 
-  // log
   const logWrap = el("logList");
   logWrap.innerHTML = "";
   (snapshot.log || []).forEach(e => {
@@ -635,7 +648,6 @@ async function postAuthed(path, body){
   try { return await res.json(); } catch(e){ return {}; }
 }
 
-// player
 async function playerPlay(){
   const amt = parseInt((el("playAmount").value || "").trim(), 10);
   if(!Number.isFinite(amt) || amt <= 0){ alert("Importo non valido"); return; }
@@ -643,7 +655,6 @@ async function playerPlay(){
   el("playAmount").value = "";
 }
 
-// cashier
 async function cashierCredit(){
   const pid = el("creditPlayer").value;
   const amt = parseInt((el("creditAmount").value || "").trim(), 10);
@@ -672,13 +683,12 @@ async function cashierExit(){
   if(!confirm("Uscire? La sessione del cassiere verrà invalidata.")) return;
   await postAuthed("/cashier/logout", {});
   clearSession();
+  clearCashierRejoinToken();
 }
 
-// boot
 loadSession();
 connectWS();
 
-// keepalive
 setInterval(() => {
   try { if(ws && ws.readyState === 1) ws.send("ping"); } catch(e) {}
 }, 25000);
@@ -694,12 +704,7 @@ async def index():
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws_manager.connect(ws)
-    # invio stato iniziale (non autenticato)
-    try:
-        await ws.send_text(json.dumps(public_state_for(None)))
-    except Exception:
-        pass
-
+    await ws_manager.send_state(ws)
     try:
         while True:
             msg = await ws.receive_text()
@@ -707,9 +712,9 @@ async def ws_endpoint(ws: WebSocket):
                 data = json.loads(msg)
                 if isinstance(data, dict) and "auth" in data:
                     ws_manager.set_user(ws, str(data.get("auth", "")).strip())
+                    await ws_manager.send_state(ws)
             except Exception:
                 pass
-            await ws_manager.broadcast()
     except WebSocketDisconnect:
         ws_manager.disconnect(ws)
     except Exception:
@@ -723,6 +728,7 @@ async def join(data: Dict[str, Any] = Body(...)):
     name = str(data.get("name", "")).strip()
     role = str(data.get("role", "giocatore")).strip()
     pin = str(data.get("pin", "")).strip()
+    rejoin_token = str(data.get("rejoin_token", "")).strip()
 
     if not name:
         return HTMLResponse("Nome mancante", status_code=400)
@@ -732,19 +738,40 @@ async def join(data: Dict[str, Any] = Body(...)):
     if role == "cassiere":
         if pin != CASHIER_PIN:
             return HTMLResponse("PIN cassiere errato", status_code=403)
+
         existing = get_cashier_id()
+
+        # Caso A: cassiere già presente -> consenti SOLO con rejoin_token corretto
         if existing:
+            server_token = GAME.get("cashier_rejoin_token") or ""
+            if not server_token or rejoin_token != server_token:
+                # Qui blocchi l'hijack: anche se conoscono il PIN, senza token non rientrano.
+                return HTMLResponse("Cassiere già attivo: token di rientro mancante o non valido", status_code=403)
+
             GAME["players"][existing]["name"] = name
             add_log(f"Cassiere rientrato: {name}")
             await ws_manager.broadcast()
-            return {"id": existing, "name": name, "role": "cassiere"}
+            return {"id": existing, "name": name, "role": "cassiere", "rejoin_token": server_token}
 
+        # Caso B: nessun cassiere -> crea cassiere nuovo e genera token rientro
+        uid = secrets.token_hex(8)
+        GAME["players"][uid] = {"name": name, "role": "cassiere", "saldo": 0}
+        ensure_ledger(uid)
+
+        token = secrets.token_urlsafe(18)
+        GAME["cashier_rejoin_token"] = token
+
+        add_log(f"{name} è entrato (cassiere)")
+        await ws_manager.broadcast()
+        return {"id": uid, "name": name, "role": "cassiere", "rejoin_token": token}
+
+    # giocatore
     uid = secrets.token_hex(8)
-    GAME["players"][uid] = {"name": name, "role": role, "saldo": 0}
+    GAME["players"][uid] = {"name": name, "role": "giocatore", "saldo": 0}
     ensure_ledger(uid)
-    add_log(f"{name} è entrato ({role})")
+    add_log(f"{name} è entrato (giocatore)")
     await ws_manager.broadcast()
-    return {"id": uid, "name": name, "role": role}
+    return {"id": uid, "name": name, "role": "giocatore"}
 
 # ==========================
 # PLAYER
@@ -921,10 +948,17 @@ async def cashier_logout(req: Request):
     GAME["players"].pop(cashier_id, None)
     GAME["ledger"].pop(cashier_id, None)
 
+    # invalida anche il token di rientro: nessuno può rientrare finché non viene creato un nuovo cassiere
+    GAME["cashier_rejoin_token"] = None
+
     add_log(f"Cassiere uscito: {name} (sessione invalidata)")
     await ws_manager.broadcast()
     return {"ok": True}
 
+# ==========================
+# START
+# ==========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "9090"))
     uvicorn.run(app, host="0.0.0.0", port=port)
+
