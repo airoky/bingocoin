@@ -9,7 +9,6 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Body
 from fastapi.responses import HTMLResponse
 import uvicorn
-
 import os
 
 # ==========================
@@ -695,7 +694,12 @@ async def index():
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws_manager.connect(ws)
-    await ws_manager.send_state(ws)
+    # invio stato iniziale (non autenticato)
+    try:
+        await ws.send_text(json.dumps(public_state_for(None)))
+    except Exception:
+        pass
+
     try:
         while True:
             msg = await ws.receive_text()
@@ -703,9 +707,9 @@ async def ws_endpoint(ws: WebSocket):
                 data = json.loads(msg)
                 if isinstance(data, dict) and "auth" in data:
                     ws_manager.set_user(ws, str(data.get("auth", "")).strip())
-                    await ws_manager.send_state(ws)
             except Exception:
                 pass
+            await ws_manager.broadcast()
     except WebSocketDisconnect:
         ws_manager.disconnect(ws)
     except Exception:
@@ -747,12 +751,6 @@ async def join(data: Dict[str, Any] = Body(...)):
 # ==========================
 @app.post("/player/play")
 async def player_play(req: Request, data: Dict[str, Any] = Body(...)):
-    """
-    Gioca: versa nel montepremi.
-      - giocatore -X
-      - pot +X
-    vincolo: X <= saldo giocatore
-    """
     try:
         player_id = require_player(req)
     except PermissionError as e:
@@ -782,11 +780,6 @@ async def player_play(req: Request, data: Dict[str, Any] = Body(...)):
 # ==========================
 @app.post("/cashier/credit")
 async def cashier_credit(req: Request, data: Dict[str, Any] = Body(...)):
-    """
-    Accredito:
-      - giocatore +X
-      - cassiere -X
-    """
     try:
         cashier_id = require_cashier(req)
     except PermissionError as e:
@@ -817,10 +810,6 @@ async def cashier_credit(req: Request, data: Dict[str, Any] = Body(...)):
 
 @app.post("/cashier/add_prize")
 async def cashier_add_prize(req: Request, data: Dict[str, Any] = Body(...)):
-    """
-    Crea premio vincolato al montepremi ATTUALE:
-      somma(premi NON pagati) + amount <= pot
-    """
     try:
         require_cashier(req)
     except PermissionError as e:
@@ -858,11 +847,6 @@ async def cashier_add_prize(req: Request, data: Dict[str, Any] = Body(...)):
 
 @app.post("/cashier/assign_prize")
 async def cashier_assign_prize(req: Request, data: Dict[str, Any] = Body(...)):
-    """
-    Assegna e paga dal montepremi:
-      - vincitore +amount
-      - pot -amount
-    """
     try:
         require_cashier(req)
     except PermissionError as e:
@@ -905,12 +889,6 @@ async def cashier_assign_prize(req: Request, data: Dict[str, Any] = Body(...)):
 
 @app.post("/cashier/reset_players")
 async def cashier_reset_players(req: Request):
-    """
-    Reset:
-      - invalida sessioni giocatori (li rimuove)
-      - azzera premi e montepremi
-      - azzera saldo cassiere
-    """
     try:
         cashier_id = require_cashier(req)
     except PermissionError as e:
@@ -934,9 +912,6 @@ async def cashier_reset_players(req: Request):
 
 @app.post("/cashier/logout")
 async def cashier_logout(req: Request):
-    """
-    Invalida sessione cassiere.
-    """
     try:
         cashier_id = require_cashier(req)
     except PermissionError as e:
@@ -950,11 +925,6 @@ async def cashier_logout(req: Request):
     await ws_manager.broadcast()
     return {"ok": True}
 
-# ==========================
-# START
-# ==========================
-#if __name__ == "__main__":
-#    uvicorn.run(app, host="0.0.0.0", port=PORT)
-if __name__ == "__main__": 
-	port = int(os.environ.get("PORT", "9090"))
-	uvicorn.run(app, host="0.0.0.0", port=port)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "9090"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
